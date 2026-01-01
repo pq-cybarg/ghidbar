@@ -140,9 +140,13 @@ def save_state(state: dict) -> None:
 class GhidBarApp(rumps.App):
     def __init__(self) -> None:
         super().__init__("🔑 ghid", quit_button=None)
+        # Track the last-seen state.json "repo" + lock so the periodic
+        # tick can detect external changes (e.g. `gbh /other/repo` or
+        # `ghid switch foo` run from a terminal) and rebuild the menu
+        # items — not just the title.
+        self._last_state_repo = (load_state().get("repo", "") or "")
+        self._last_locked: bool | None = None
         self.menu = self._build_menu()
-        # Auto-refresh title every 5 s in case the repo state changed
-        # outside the app (e.g. user ran `ghid lock` in a terminal).
         rumps.Timer(self._tick, 5).start()
 
     # ---- menu construction ---- #
@@ -213,16 +217,33 @@ class GhidBarApp(rumps.App):
 
     def _tick(self, _sender) -> None:
         state = load_state()
-        repo = Path(state.get("repo", "")) if state.get("repo") else None
+        repo_str = state.get("repo", "") or ""
+        repo = Path(repo_str) if repo_str else None
+        identity = ""
+        locked = False
+        if repo and (repo / ".git").exists():
+            identity, _verified, locked = current_repo_identity(repo)
+        # If the watched repo OR its lock state changed since the last
+        # tick, rebuild the menu items so the "Repo:" / "Identity:" /
+        # "Lock / Unlock" labels reflect reality.
+        if (repo_str != self._last_state_repo
+                or locked != self._last_locked):
+            self._last_state_repo = repo_str
+            self._last_locked = locked
+            self.menu.clear()
+            for item in self._build_menu():
+                if item is None:
+                    self.menu.add(rumps.separator)
+                else:
+                    self.menu.add(item)
+        # Title.
         if not repo or not (repo / ".git").exists():
             self.title = "🔑 ghid"
             return
-        identity, _verified, locked = current_repo_identity(repo)
         if not identity:
             self.title = "🔑 ⚠"
             return
-        lock = " 🔒" if locked else ""
-        self.title = f"🔑 {identity}{lock}"
+        self.title = f"🔑 {identity}{' 🔒' if locked else ''}"
 
     # ---- helpers ---- #
 

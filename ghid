@@ -15,6 +15,11 @@
 #   ghid list                  — list configured identities + verify each
 #   ghid doctor                — sanity-check ~/.ssh/config + keys
 #   ghid current               — show current repo's bound identity
+#   ghid init <identity>       — `git init` here under <identity>'s per-repo
+#                                user.name/email + pre-locked (never touches
+#                                global git config). Reads email from
+#                                ~/.config/ghidbar/identities.conf
+#                                (or --email <addr>).
 #   ghid switch <identity>     — rewrite this repo's remotes to use <identity>
 #   ghid lock <identity>       — bind this repo to <identity> via pre-push hook
 #   ghid unlock                — remove the binding
@@ -213,6 +218,90 @@ cmd_current() {
             ok "lock:  this repo is locked to identity $(c_bold "$locked")"
         fi
     fi
+}
+
+cmd_init() {
+    local id="${1:-}"
+    [[ -z "$id" ]] && die "usage: ghid init <identity> [--email <addr>]
+ghid init creates a fresh git repo here, bound to <identity>:
+  - per-repo user.name / user.email (never touches ~/.gitconfig)
+  - credential.helper disabled for this repo (HTTPS leak prevention)
+  - pre-installed lock hook (push refused unless URL uses github-<id>)
+
+Email lookup order:
+  1. --email <addr> flag
+  2. \$HOME/.config/ghidbar/identities.conf  (one line per identity)
+     format: <identity>=<email>
+     example: pq-cybarg=resistant@tuta.com"
+    shift || true
+
+    local email=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --email) email="${2:-}"; shift 2 ;;
+            *) die "unknown arg: $1" ;;
+        esac
+    done
+
+    in_git_repo && die "already a git repo here. Use \`ghid switch $id\` to bind the existing repo."
+
+    local alias; alias=$(alias_for_identity "$id")
+    grep -qE "^Host[[:space:]]+$alias\\b" "$SSH_CONFIG" \
+        || die "no \`Host $alias\` in $SSH_CONFIG. Run \`ghid new $id\` first."
+
+    if [[ -z "$email" ]]; then
+        local conf="$HOME/.config/ghidbar/identities.conf"
+        if [[ -f "$conf" ]]; then
+            email=$(grep -E "^${id}=" "$conf" | head -1 | sed "s/^${id}=//")
+        fi
+    fi
+    if [[ -z "$email" ]]; then
+        die "no email known for identity '$id'.
+Pass --email <addr>, or add to \$HOME/.config/ghidbar/identities.conf:
+    $id=<your-email-for-this-identity>"
+    fi
+
+    git init -b main >/dev/null 2>&1 || git init >/dev/null
+    ok "git init"
+
+    git config --local user.name "$id"
+    git config --local user.email "$email"
+    git config --local credential.helper ""
+    ok "user.name  = $(c_bold "$id")  (local-only)"
+    ok "user.email = $(c_bold "$email")  (local-only — \$HOME/.gitconfig untouched)"
+    ok "credential.helper disabled for this repo"
+
+    # Lock hook — same shape as cmd_lock's, simplified (no unified-hook branch).
+    git config --local ghid.lock-identity "$id"
+    local hook_dir; hook_dir="$(git rev-parse --git-dir)/hooks"
+    local hook="$hook_dir/pre-push"
+    mkdir -p "$hook_dir"
+    cat > "$hook" <<HOOK
+#!/usr/bin/env bash
+# GHID_LOCK=$id
+# Pre-locked at \`ghid init\` time. Refuses pushes whose remote URL
+# isn't routed through git@$alias:... Unlock with: ghid unlock
+set -euo pipefail
+remote_url=\$(git remote get-url "\$1" 2>/dev/null || echo "")
+case "\$remote_url" in
+  git@${alias}:*) exit 0 ;;
+  *)
+    echo "" >&2
+    echo "  ✗ ghid: push refused — this repo is locked to '$id' but the" >&2
+    echo "    push target is: \$remote_url" >&2
+    echo "    If you meant to switch identity, run:  ghid switch <id>" >&2
+    exit 1
+    ;;
+esac
+HOOK
+    chmod +x "$hook"
+    ok "pre-locked to $(c_bold "$id") (pre-push hook installed)"
+
+    _update_ghidbar_state
+
+    echo
+    echo "  Next:  git remote add origin git@${alias}:${id}/<repo>.git"
+    echo "         touch README.md && git add . && git commit -m 'first commit'"
 }
 
 cmd_switch() {
@@ -466,6 +555,7 @@ case "$cmd" in
     list)     cmd_list ;;
     doctor)   cmd_doctor ;;
     current)  cmd_current ;;
+    init)     cmd_init "$@" ;;
     switch)   cmd_switch "$@" ;;
     lock)     cmd_lock "$@" ;;
     unlock)   cmd_unlock ;;

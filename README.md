@@ -22,7 +22,7 @@ companion that surfaces the current repo's bound identity at a glance.
 
 | File | What it is |
 |---|---|
-| `ghid` | Bash CLI: list / doctor / current / switch / lock / unlock / verify / whoami / new / rotate |
+| `ghid` | Bash CLI: list / doctor / current / init / switch / lock / unlock / verify / whoami / new / rotate |
 | `ghidbar.py` | macOS menu-bar app (uses [rumps](https://github.com/jaredks/rumps)) |
 | `ghidbar` | shell launcher for the menu-bar app |
 | `ghidbar.plist` | launchd template for auto-start at login (uses `__HOME__` placeholder) |
@@ -64,6 +64,36 @@ ghid verify myalias
 In the menu bar, ghidbar shows `🔑 myalias 🔒` while you're in the repo
 (its watched repo is set via the `ghidbar-here` / `gbh` shell function
 added to `~/.zshrc` by the install).
+
+## Fresh-repo init (no global git config pollution)
+
+`ghid init` creates a new repo bound to a specific identity *without*
+touching `~/.gitconfig`:
+
+```bash
+mkdir ~/newproject && cd ~/newproject
+ghid init myalias
+# → git init
+# → user.name = myalias      (local-only)
+# → user.email = <looked up> (local-only — ~/.gitconfig untouched)
+# → credential.helper disabled for this repo (HTTPS leak prevention)
+# → pre-locked: pre-push hook refuses any non-github-myalias push
+```
+
+The email is looked up from `~/.config/ghidbar/identities.conf` — one
+line per identity:
+
+```
+# ~/.config/ghidbar/identities.conf
+myalias=me+myalias@example.com
+otheralias=me+other@example.com
+```
+
+…or pass `--email <addr>` explicitly:
+
+```bash
+ghid init myalias --email me+myalias@example.com
+```
 
 ## Key rotation
 
