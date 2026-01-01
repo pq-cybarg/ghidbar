@@ -25,7 +25,11 @@
 #   ghid unlock                — remove the binding
 #   ghid verify [<identity>]   — confirm ssh -T resolves to expected user
 #   ghid whoami                — quick: who would `git push` from this repo be?
-#   ghid new <identity>        — create a new key + SSH alias for <identity>
+#   ghid new <identity>        — create a new key + SSH alias for
+#                                <identity>; also records the identity's
+#                                email (prompted, or via --email <addr>) at
+#                                ~/.config/ghidbar/identities.conf so future
+#                                `ghid init` calls auto-bind it.
 #
 # Why it exists: GitHub identifies SSH-authenticated users by key
 # fingerprint. The `User <name>` field in ~/.ssh/config is cosmetic and
@@ -54,6 +58,43 @@ err()      { echo "  $(c_red ✗) $*" >&2; }
 die()      { err "$*"; exit 1; }
 
 in_git_repo() { git rev-parse --git-dir >/dev/null 2>&1; }
+
+# Per-identity email is stored at:
+#   $HOME/.config/ghidbar/identities.conf
+# Format: one identity per line as `<identity>=<email>`. Comments
+# start with `#` and are preserved on update.
+IDENTITIES_CONF="$HOME/.config/ghidbar/identities.conf"
+
+# Read the email for <identity> from IDENTITIES_CONF, or empty.
+_identity_email() {
+    local id="$1"
+    [[ -f "$IDENTITIES_CONF" ]] || return 0
+    grep -E "^${id}=" "$IDENTITIES_CONF" 2>/dev/null | head -1 | sed "s/^${id}=//"
+}
+
+# Set <identity>=<email> in IDENTITIES_CONF (replace if exists, append
+# if not). Touches the parent dir and the file as needed.
+_identity_email_set() {
+    local id="$1" email="$2"
+    mkdir -p "$(dirname "$IDENTITIES_CONF")"
+    if [[ -f "$IDENTITIES_CONF" ]] && grep -qE "^${id}=" "$IDENTITIES_CONF"; then
+        # Replace in place. Use a tmpfile rather than sed -i for
+        # portability across BSD / GNU sed.
+        local tmp; tmp=$(mktemp)
+        awk -v id="$id" -v new="${id}=${email}" '
+            $0 ~ "^" id "=" { print new; next }
+            { print }
+        ' "$IDENTITIES_CONF" > "$tmp"
+        mv "$tmp" "$IDENTITIES_CONF"
+    else
+        [[ -f "$IDENTITIES_CONF" ]] || cat > "$IDENTITIES_CONF" <<'HDR'
+# ghidbar identity → email map.
+# Auto-managed by `ghid new` (and `ghid init --email <addr>`).
+# One entry per identity: <identity>=<email>
+HDR
+        printf "%s=%s\n" "$id" "$email" >> "$IDENTITIES_CONF"
+    fi
+}
 
 # Push the current repo path into ghidbar's state file so the
 # menu-bar app's 5 s timer picks it up and refreshes the title /
@@ -178,19 +219,22 @@ cmd_doctor() {
 cmd_list() {
     echo "$(c_bold Identities)"
     echo
-    printf "  %-22s  %-44s  %s\n" "ALIAS" "KEY" "GITHUB RESOLVES TO"
+    printf "  %-22s  %-32s  %-22s  %s\n" "ALIAS" "EMAIL" "KEY" "GITHUB RESOLVES TO"
     while IFS='|' read -r alias key; do
         [[ -z "$alias" ]] && continue
+        local id; id=$(identity_for_alias "$alias")
+        local email; email=$(_identity_email "$id")
+        [[ -z "$email" ]] && email="$(c_dim '(unset; ghid init needs --email)')"
         local resolved
         resolved=$(resolve_alias "$alias")
         if [[ -z "$resolved" ]]; then
             resolved="$(c_red unreachable / no key registered)"
-        elif [[ "$resolved" == "$(identity_for_alias "$alias")" ]]; then
+        elif [[ "$resolved" == "$id" ]]; then
             resolved="$(c_grn "$resolved")  ✓"
         else
             resolved="$(c_red "$resolved")  $(c_red MISMATCH)"
         fi
-        printf "  %-22s  %-44s  %s\n" "$alias" "$key" "$resolved"
+        printf "  %-22s  %-32s  %-22s  %s\n" "$alias" "$email" "$key" "$resolved"
     done < <(list_aliases)
 }
 
@@ -249,16 +293,12 @@ Email lookup order:
     grep -qE "^Host[[:space:]]+$alias\\b" "$SSH_CONFIG" \
         || die "no \`Host $alias\` in $SSH_CONFIG. Run \`ghid new $id\` first."
 
-    if [[ -z "$email" ]]; then
-        local conf="$HOME/.config/ghidbar/identities.conf"
-        if [[ -f "$conf" ]]; then
-            email=$(grep -E "^${id}=" "$conf" | head -1 | sed "s/^${id}=//")
-        fi
-    fi
+    [[ -z "$email" ]] && email=$(_identity_email "$id")
     if [[ -z "$email" ]]; then
         die "no email known for identity '$id'.
-Pass --email <addr>, or add to \$HOME/.config/ghidbar/identities.conf:
-    $id=<your-email-for-this-identity>"
+Pass --email <addr>, or add to $IDENTITIES_CONF:
+    $id=<your-email-for-this-identity>
+Or re-run \`ghid new $id\` and supply --email there so it's recorded once."
     fi
 
     git init -b main >/dev/null 2>&1 || git init >/dev/null
@@ -442,9 +482,37 @@ cmd_whoami() {
 
 cmd_new() {
     local id="${1:-}"
-    [[ -z "$id" ]] && die "usage: ghid new <identity>"
+    [[ -z "$id" ]] && die "usage: ghid new <identity> [--email <addr>]
+The email is recorded in $IDENTITIES_CONF so future
+\`ghid init <identity>\` calls can find it automatically."
+    shift || true
+    local email=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --email) email="${2:-}"; shift 2 ;;
+            *) die "unknown arg: $1" ;;
+        esac
+    done
+
     local alias; alias=$(alias_for_identity "$id")
     local key="$HOME/.ssh/${id}-GitHub"
+
+    # Email: --email > existing identities.conf entry > interactive prompt.
+    if [[ -z "$email" ]]; then
+        email=$(_identity_email "$id")
+    fi
+    if [[ -z "$email" ]]; then
+        if [[ -t 0 ]]; then
+            printf "  email to record for identity '%s' (used by 'ghid init'): " "$id" >&2
+            read -r email
+        fi
+    fi
+    if [[ -n "$email" ]]; then
+        _identity_email_set "$id" "$email"
+        ok "recorded $id=$email in $IDENTITIES_CONF"
+    else
+        warn "no email recorded for $id; \`ghid init $id\` will prompt or require --email."
+    fi
 
     if grep -qE "^Host[[:space:]]+$alias\\b" "$SSH_CONFIG" 2>/dev/null; then
         warn "alias $alias already exists in $SSH_CONFIG — skipping config append"
