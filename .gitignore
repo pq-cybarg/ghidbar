@@ -1,0 +1,4 @@
+# nothing user-state should ever live in this repo
+*.pyc
+__pycache__/
+.DS_Store
