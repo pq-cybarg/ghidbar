@@ -22,7 +22,7 @@ companion that surfaces the current repo's bound identity at a glance.
 
 | File | What it is |
 |---|---|
-| `ghid` | Bash CLI: list / doctor / current / init / switch / lock / unlock / verify / whoami / new / rotate |
+| `ghid` | Bash CLI: list / doctor / current / init / switch / lock / unlock / guard / verify / whoami / new / rotate |
 | `ghidbar.py` | macOS menu-bar app (uses [rumps](https://github.com/jaredks/rumps)) |
 | `ghidbar` | shell launcher for the menu-bar app |
 | `ghidbar.plist` | launchd template for auto-start at login (uses `__HOME__` placeholder) |
@@ -103,6 +103,36 @@ ghid rotate myalias
 #   prints both new pubkey and old fingerprint so you know what to
 #   add and what to delete on github.com/settings/keys.
 ```
+
+## Machine-wide new-repo guard
+
+`ghid init` / `ghid lock` are per-repo and opt-in — you have to remember to
+run them. The guard is the backstop for when you forget:
+
+```bash
+ghid guard install     # set a global git init.templateDir pre-commit hook
+ghid guard status      # show whether the guard is active
+ghid guard uninstall   # remove it
+```
+
+Once installed, git copies the hook into **every** new `git init` / `git clone`
+(in any terminal — it's enforced by git itself, not shell state). The hook
+refuses to commit until the repo has an explicit **local** `user.email`, so a
+brand-new repo can never silently inherit your global identity:
+
+```
+✗ ghid-guard: this repo has no explicit (local) git identity.
+  A commit here would inherit your GLOBAL identity:  you@work.example
+  Pick an identity first (prevents opsec leaks):
+    ghid init <identity>
+    git config --local user.name/.email ...
+```
+
+Properties:
+- **Existing repos are untouched** — the template only seeds newly-created repos.
+- **Non-destructive** — `ghid guard uninstall` removes it; if you already had an
+  `init.templateDir`, the guard merges into it rather than overwriting.
+- **Deliberate bypass:** `GHID_GUARD_DISABLE=1 git commit ...`.
 
 ## Identity isolation guarantee
 

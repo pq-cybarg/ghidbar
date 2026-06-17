@@ -23,6 +23,11 @@
 #   ghid switch <identity>     — rewrite this repo's remotes to use <identity>
 #   ghid lock <identity>       — bind this repo to <identity> via pre-push hook
 #   ghid unlock                — remove the binding
+#   ghid guard {install|status|uninstall}
+#                              — machine-wide backstop: a global git template
+#                                pre-commit hook so EVERY new `git init`/`clone`
+#                                refuses commits until an explicit local
+#                                identity is chosen (no silent global leaks)
 #   ghid verify [<identity>]   — confirm ssh -T resolves to expected user
 #   ghid whoami                — quick: who would `git push` from this repo be?
 #   ghid new <identity>        — create a new key + SSH alias for
@@ -615,6 +620,141 @@ cmd_rotate() {
         echo "Old key archived (revertable):  $archive_dir/${id}-GitHub.${ts}.old{,.pub}"
 }
 
+# Machine-wide new-repo guard.
+#
+# `ghid <subcmd>` is per-repo and opt-in — you have to remember to run
+# `ghid init`. The guard is the backstop for when you forget: a global git
+# `init.templateDir` pre-commit hook that git copies into EVERY new repo, so a
+# brand-new `git init`/`git clone` can never silently inherit your global
+# identity. The hook refuses to commit until the repo has an explicit LOCAL
+# user.email (set by `ghid init` or by hand). Works in every terminal because
+# it's enforced by git itself, not by shell state.
+GUARD_MARKER="GHID_GUARD_V1"
+GUARD_TEMPLATE_DEFAULT="$HOME/.config/git/ghid-template"
+
+# Resolve the hooks directory the guard should live in: respect an existing
+# global init.templateDir if one is set, else use our default.
+_guard_target_dir() {
+    local existing
+    existing=$(git config --global init.templateDir 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+        echo "${existing/#\~/$HOME}"
+    else
+        echo "$GUARD_TEMPLATE_DEFAULT"
+    fi
+}
+
+# Emit the pre-commit hook body (quoted heredoc — no expansion here; all
+# expansion happens when the hook itself runs).
+_guard_hook_body() {
+    cat <<'HOOK'
+#!/usr/bin/env bash
+# GHID_GUARD_V1 — installed by `ghid guard install` via git init.templateDir.
+# Refuses to commit in a repo with no explicit LOCAL git identity, so a new
+# repo can never silently inherit your global identity. Choose one first with
+# `ghid init <id>` or `git config --local user.email/.name`.
+set -euo pipefail
+[[ "${GHID_GUARD_DISABLE:-0}" == "1" ]] && exit 0
+local_email=$(git config --local user.email 2>/dev/null || true)
+[[ -n "$local_email" ]] && exit 0   # explicit per-repo identity chosen — allow
+global_email=$(git config user.email 2>/dev/null || echo "?")
+{
+  echo ""
+  echo "  ✗ ghid-guard: this repo has no explicit (local) git identity."
+  echo "    A commit here would inherit your GLOBAL identity:  $global_email"
+  echo "    Pick an identity first (prevents opsec leaks):"
+  echo "      ghid init <identity>                 # brand-new repo, bound + locked"
+  echo "      git config --local user.name  <name>"
+  echo "      git config --local user.email <addr>"
+  if [[ -f "$HOME/.config/ghidbar/identities.conf" ]]; then
+    echo "    Known ghid identities (id=email):"
+    grep -vE '^[[:space:]]*#' "$HOME/.config/ghidbar/identities.conf" | sed 's/^/      /'
+  fi
+  echo "    Bypass once (deliberate):  GHID_GUARD_DISABLE=1 git commit ..."
+  echo ""
+} >&2
+exit 1
+HOOK
+}
+
+cmd_guard() {
+    local action="${1:-status}"
+    case "$action" in
+        install)   _guard_install ;;
+        status)    _guard_status ;;
+        uninstall) _guard_uninstall ;;
+        *) die "usage: ghid guard {install|status|uninstall}" ;;
+    esac
+}
+
+_guard_install() {
+    local existing dir hook
+    existing=$(git config --global init.templateDir 2>/dev/null || true)
+    dir=$(_guard_target_dir)
+    hook="$dir/hooks/pre-commit"
+    mkdir -p "$dir/hooks"
+
+    if [[ -f "$hook" ]] && ! grep -q "$GUARD_MARKER" "$hook"; then
+        die "a non-ghid pre-commit hook already exists at $hook — refusing to overwrite. Inspect/merge it by hand."
+    fi
+
+    _guard_hook_body > "$hook"
+    chmod +x "$hook"
+    ok "guard hook installed at $hook"
+
+    if [[ -z "$existing" ]]; then
+        git config --global init.templateDir "$dir"
+        ok "git config --global init.templateDir = $(c_bold "$dir")"
+    elif [[ "${existing/#\~/$HOME}" == "$dir" ]]; then
+        ok "init.templateDir already = $existing"
+    else
+        ok "merged guard into your existing init.templateDir ($existing)"
+    fi
+    echo "  Every new \`git init\`/\`git clone\` now refuses commits until an identity is set."
+    echo "  Existing repos are untouched. Disable: ghid guard uninstall"
+}
+
+_guard_status() {
+    local td hook
+    td=$(git config --global init.templateDir 2>/dev/null || true)
+    if [[ -z "$td" ]]; then
+        warn "no global init.templateDir set — guard is NOT active. Enable: ghid guard install"
+        return 0
+    fi
+    echo "  init.templateDir: $td"
+    hook="${td/#\~/$HOME}/hooks/pre-commit"
+    if [[ -f "$hook" ]] && grep -q "$GUARD_MARKER" "$hook"; then
+        ok "ghid-guard active — new repos require an explicit local identity"
+    else
+        warn "init.templateDir is set but no ghid-guard hook at $hook"
+    fi
+}
+
+_guard_uninstall() {
+    local td dir hook
+    td=$(git config --global init.templateDir 2>/dev/null || true)
+    if [[ -z "$td" ]]; then
+        warn "no init.templateDir set — nothing to uninstall"
+        return 0
+    fi
+    dir="${td/#\~/$HOME}"
+    hook="$dir/hooks/pre-commit"
+    if [[ -f "$hook" ]] && grep -q "$GUARD_MARKER" "$hook"; then
+        rm "$hook"
+        ok "removed guard hook $hook"
+    else
+        warn "no ghid-guard hook at $hook (left other files alone)"
+    fi
+    # Only tear down config + dir if this is the dir we created.
+    if [[ "$dir" == "$GUARD_TEMPLATE_DEFAULT" ]]; then
+        rmdir "$dir/hooks" "$dir" 2>/dev/null || true
+        git config --global --unset init.templateDir 2>/dev/null || true
+        ok "unset global init.templateDir"
+    else
+        warn "left init.templateDir = $td in place (not created by ghid)"
+    fi
+}
+
 # ---- dispatch ---- #
 
 cmd="${1:-doctor}"
@@ -627,11 +767,12 @@ case "$cmd" in
     switch)   cmd_switch "$@" ;;
     lock)     cmd_lock "$@" ;;
     unlock)   cmd_unlock ;;
+    guard)    cmd_guard "$@" ;;
     verify)   cmd_verify "$@" ;;
     whoami)   cmd_whoami ;;
     new)      cmd_new "$@" ;;
     -h|--help|help)
-        sed -n '4,30p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '4,38p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *) die "unknown subcommand: $cmd (try: ghid help)" ;;
 esac
